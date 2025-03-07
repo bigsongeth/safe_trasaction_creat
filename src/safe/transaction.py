@@ -1,30 +1,72 @@
 from typing import List, Dict
 import os
+import sys
+import json
+from pathlib import Path
+from dotenv import load_dotenv
+from decimal import Decimal
 from web3 import Web3
 from eth_account import Account
-from safe_eth.eth import EthereumClient
-from safe_eth.safe import Safe, SafeTx
-from dotenv import load_dotenv
-import requests
-import json
+from hexbytes import HexBytes
+
+# 导入safe-eth-py相关库
+from safe_eth.eth import EthereumClient, EthereumNetwork
+from safe_eth.safe.api.transaction_service_api import TransactionServiceApi
+from safe_eth.safe import Safe
+from safe_eth.safe.multi_send import MultiSend, MultiSendTx, MultiSendOperation
 
 load_dotenv()
 
 class SafeTransactionHandler:
     def __init__(self):
-        self.w3 = Web3(Web3.HTTPProvider(os.getenv("RPC_URL")))
+        """
+        初始化Safe交易处理器
+        """
+        # 配置信息
+        self.network = os.getenv("NETWORK", "sepolia")
+        self.rpc_url = os.getenv("RPC_URL")
         self.safe_address = os.getenv("SAFE_ADDRESS")
-        self.usdt_contract = os.getenv("USDT_CONTRACT")
         self.private_key = os.getenv("PRIVATE_KEY")
+        self.usdt_contract_address = os.getenv("USDT_CONTRACT")
         
-        # 使用Safe Transaction Service API
-        self.network = os.getenv("NETWORK", "sepolia")  # 默认使用 sepolia 测试网
-        self.base_url = f"https://safe-transaction-{self.network}.safe.global/api/v1"
+        print(f"网络: {self.network}")
+        print(f"Safe地址: {self.safe_address}")
+        print(f"USDT合约地址: {self.usdt_contract_address}")
         
-        # 初始化 Safe SDK 客户端
-        self.ethereum_client = EthereumClient(self.w3)
+        # 初始化Web3
+        self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+        print(f"Web3连接状态: {'成功' if self.w3.is_connected() else '失败'}")
         
-        # USDT ABI - 添加 balanceOf 方法
+        # 初始化以太坊客户端
+        self.ethereum_client = EthereumClient(self.rpc_url)
+        
+        # 设置网络
+        if self.network.lower() == 'mainnet':
+            self.ethereum_network = EthereumNetwork.MAINNET
+            # MultiSendCallOnly合约地址 (mainnet)
+            self.multisend_address = "0x40A2aCCbd92BCA938b02010E17A5b8929b49130D"
+        elif self.network.lower() == 'sepolia':
+            self.ethereum_network = EthereumNetwork.SEPOLIA
+            # MultiSendCallOnly合约地址 (sepolia)
+            self.multisend_address = "0x9641d764fc13c8B624c04430C7356C1C7C8102e2"
+        else:
+            raise ValueError(f"不支持的网络: {self.network}")
+        
+        print(f"使用MultiSendCallOnly合约地址: {self.multisend_address}")
+        
+        # 初始化MultiSend
+        self.multisend = MultiSend(ethereum_client=self.ethereum_client, address=self.multisend_address)
+        
+        # 初始化Safe
+        self.safe = Safe(self.safe_address, self.ethereum_client)
+        
+        # 初始化交易服务API
+        self.transaction_service_api = TransactionServiceApi(
+            network=self.ethereum_network,
+            ethereum_client=self.ethereum_client
+        )
+        
+        # USDT ABI
         self.usdt_abi = [
             {
                 "constant": True,
@@ -49,17 +91,22 @@ class SafeTransactionHandler:
             }
         ]
         
+        # 初始化USDT合约
         self.usdt_contract = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(self.usdt_contract),
+            address=self.w3.to_checksum_address(self.usdt_contract_address),
             abi=self.usdt_abi
         )
-
+    
     def prepare_batch_transfers(self, transactions: List[Dict]) -> Dict:
         """
-        准备批量USDT转账交易
-        """
-        multisend_txs = []
+        准备批量USDT转账交易，使用MultiSendCallOnly合约
         
+        Args:
+            transactions: 交易列表，每个交易包含address和amount
+            
+        Returns:
+            构建好的交易数据字典
+        """
         print(f"\n找到 {len(transactions)} 笔待处理交易:")
         
         # 先检查USDT余额
@@ -72,7 +119,11 @@ class SafeTransactionHandler:
         if safe_balance < total_amount * 10**6:
             raise Exception(f"USDT余额不足. 需要: {total_amount} USDT, 当前余额: {safe_balance / 10**6} USDT")
         
-        for tx in transactions:
+        # 准备多个交易
+        print("准备多笔USDT转账交易...")
+        multi_send_txs = []
+        
+        for i, tx in enumerate(transactions):
             try:
                 raw_address = tx["address"]
                 print("\nSafe处理:")
@@ -89,137 +140,187 @@ class SafeTransactionHandler:
                     continue
                     
                 amount = tx["amount"]
-                print(f"转账金额: {amount} USDT")
+                amount_wei = int(Decimal(amount) * Decimal(10**6))  # USDT有6位小数
+                print(f"转账金额: {amount} USDT ({amount_wei} 最小单位)")
                 
-                # 构造USDT transfer数据
+                # 生成USDT转账数据
+                print(f"生成USDT转账数据...")
                 transfer_data = self.usdt_contract.functions.transfer(
                     address,
-                    int(amount * 10**6)  # USDT有6位小数
+                    amount_wei
                 ).build_transaction({
-                    "from": self.safe_address,
-                    "nonce": 0
-                })
+                    'chainId': self.w3.eth.chain_id,
+                    'gas': 0,
+                    'gasPrice': 0,
+                    'nonce': 0
+                })['data']
                 
-                multisend_txs.append({
-                    "to": self.usdt_contract.address,
-                    "data": transfer_data["data"],
-                    "value": 0,
-                    "operation": 0
-                })
-                print(f"已添加交易: {amount} USDT -> {address}")
+                print(f"转账数据生成成功: {transfer_data[:10]}...（长度：{len(transfer_data)}）")
+                
+                # 创建MultiSendTx对象
+                multi_send_tx = MultiSendTx(
+                    operation=MultiSendOperation.CALL,  # 标准调用
+                    to=self.usdt_contract.address,  # USDT合约地址
+                    value=0,  # 不发送ETH
+                    data=HexBytes(transfer_data)  # 转账数据
+                )
+                
+                multi_send_txs.append(multi_send_tx)
+                print(f"交易 {i+1}: 发送 {amount} USDT 给 {address}")
                 
             except Exception as e:
                 print(f"处理交易时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 continue
-
-        if not multisend_txs:
-            raise Exception("没有可执行的交易")
-
-        try:
-            # 使用Safe API获取当前nonce
-            response = requests.get(f"{self.base_url}/safes/{self.safe_address}/")
-            response.raise_for_status()
-            nonce = response.json()["nonce"]
-            
-            # 构造交易数据
-            tx_data = {
-                "to": self.usdt_contract.address,
-                "value": "0",  # API 期望字符串格式的数字
-                "data": multisend_txs[0]["data"],
-                "operation": 0,
-                "safeTxGas": "0",
-                "baseGas": "0",
-                "gasPrice": "0",
-                "gasToken": "0x0000000000000000000000000000000000000000",
-                "refundReceiver": "0x0000000000000000000000000000000000000000",
-                "nonce": str(nonce)  # 转换为字符串
-            }
-            
-            # 确保data是十六进制字符串
-            if isinstance(tx_data["data"], int):
-                tx_data["data"] = hex(tx_data["data"])
-            elif not isinstance(tx_data["data"], str) or not tx_data["data"].startswith('0x'):
-                tx_data["data"] = '0x' + tx_data["data"] if isinstance(tx_data["data"], str) else '0x'
-            
-            print("\n发送给API的数据:")
-            print(json.dumps(tx_data, indent=2))
-            
-            # 获取gas估算
-            response = requests.post(
-                f"{self.base_url}/safes/{self.safe_address}/multisig-transactions/estimations/",
-                json=tx_data
-            )
-            response.raise_for_status()
-            gas_estimated = response.json()
-            
-            print("Gas估算结果:", gas_estimated)
-            
-            # 更新gas信息
-            tx_data.update({
-                "safeTxGas": gas_estimated.get("safeTxGas", "0"),
-                # 其他gas参数保持为"0"
-                "baseGas": "0",
-                "gasPrice": "0"
-            })
-            
-            # 打印最终的交易数据
-            print("\n最终交易数据:")
-            print(json.dumps(tx_data, indent=2))
-            
-            return tx_data
-            
-        except Exception as e:
-            print(f"创建Safe交易失败: {str(e)}")
-            raise
         
+        if not multi_send_txs:
+            raise Exception("没有可执行的交易")
+        
+        # 获取Safe信息
+        print("\n获取Safe信息...")
+        safe_info = self.safe.retrieve_all_info()
+        print(f"Safe信息: {safe_info}")
+        
+        # 编码MultiSend数据
+        print("编码MultiSend数据...")
+        multisend_data = self.multisend.build_tx_data(multi_send_txs)
+        print(f"MultiSend数据长度: {len(multisend_data)}")
+        
+        # 创建Safe交易
+        print("创建Safe交易...")
+        safe_tx = self.safe.build_multisig_tx(
+            to=self.multisend_address,  # MultiSendCallOnly合约地址
+            value=0,  # 不发送ETH
+            data=HexBytes(multisend_data),  # MultiSend数据
+            operation=0  # 0表示标准CALL
+        )
+        
+        print(f"Safe交易哈希: {safe_tx.safe_tx_hash.hex()}")
+        
+        # 构造API需要的交易数据
+        tx_data = {
+            "to": self.multisend_address,
+            "value": "0",
+            "data": multisend_data.hex(),
+            "operation": 0,
+            "safeTxGas": str(safe_tx.safe_tx_gas),
+            "baseGas": str(safe_tx.base_gas),
+            "gasPrice": str(safe_tx.gas_price),
+            "gasToken": safe_tx.gas_token or "0x0000000000000000000000000000000000000000",
+            "refundReceiver": safe_tx.refund_receiver or "0x0000000000000000000000000000000000000000",
+            "nonce": str(safe_tx.safe_nonce)
+        }
+        
+        print("\n最终交易数据:")
+        print(json.dumps(tx_data, indent=2))
+        
+        return tx_data
+    
     def sign_transaction(self, safe_tx: Dict) -> str:
         """
         使用私钥签名Safe交易
-        """
-        account = Account.from_key(self.private_key)
         
-        # 打印调试信息
-        print("\n开始签名交易:")
-        print("交易数据:", json.dumps(safe_tx, indent=2))
+        Args:
+            safe_tx: 交易数据字典
+            
+        Returns:
+            签名结果字符串
+        """
+        print("\n开始签名交易...")
         
         try:
-            # 重新初始化 ethereum_client，使用 RPC URL
-            ethereum_client = EthereumClient(os.getenv("RPC_URL"))
-            
             # 确保data是十六进制字符串
             data = safe_tx["data"]
-            if isinstance(data, int):
-                data = hex(data)
-            elif not isinstance(data, (bytes, str)) or (isinstance(data, str) and not data.startswith('0x')):
-                data = '0x' + data if isinstance(data, str) else '0x'
-                
-            tx = SafeTx(
-                ethereum_client,  # 使用新创建的 ethereum_client
-                self.safe_address,
-                safe_tx["to"],
-                int(safe_tx["value"]),
-                data,  # 使用处理后的data
-                safe_tx["operation"],
-                int(safe_tx["safeTxGas"]),
-                int(safe_tx["baseGas"]),
-                int(safe_tx["gasPrice"]),
-                safe_tx["gasToken"],
-                safe_tx["refundReceiver"],
-                int(safe_tx["nonce"])
+            if isinstance(data, str) and not data.startswith('0x'):
+                data = '0x' + data
+            
+            # 构建SafeTx对象
+            tx = self.safe.build_multisig_tx(
+                to=self.w3.to_checksum_address(safe_tx["to"]),
+                value=int(safe_tx["value"]),
+                data=HexBytes(data),
+                operation=int(safe_tx["operation"]),
+                safe_tx_gas=int(safe_tx["safeTxGas"]),
+                base_gas=int(safe_tx["baseGas"]),
+                gas_price=int(safe_tx["gasPrice"]),
+                gas_token=safe_tx["gasToken"],
+                refund_receiver=safe_tx["refundReceiver"],
+                safe_nonce=int(safe_tx["nonce"])
             )
             
-            # 打印交易哈希信息
+            # 打印交易哈希
             safe_tx_hash = tx.safe_tx_hash.hex()
             print(f"交易哈希: {safe_tx_hash}")
-            print(f"签名者地址: {account.address}")
             
-            # 使用私钥的十六进制表示进行签名
-            signature = tx.sign(account.key.hex())
-            print("签名成功:", signature)
+            # 使用私钥签名
+            signature = tx.sign(self.private_key)
+            print(f"签名成功: {signature}")
+            
             return signature
             
         except Exception as e:
             print(f"签名失败: {str(e)}")
-            raise 
-
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def propose_transaction(self, safe_tx: Dict, signature: str) -> str:
+        """
+        向Safe交易服务提议交易
+        
+        Args:
+            safe_tx: 交易数据字典
+            signature: 交易签名
+            
+        Returns:
+            交易哈希
+        """
+        print("提议Safe交易...")
+        
+        try:
+            # 获取Safe信息
+            safe_info = self.safe.retrieve_all_info()
+            print(f"Safe阈值: {safe_info.threshold}")
+            print(f"所有者数量: {len(safe_info.owners)}")
+            
+            # 构建SafeTx对象
+            data = safe_tx["data"]
+            if isinstance(data, str) and not data.startswith('0x'):
+                data = '0x' + data
+            
+            # 使用与sign_transaction相同的方式构建SafeTx对象
+            tx = self.safe.build_multisig_tx(
+                to=self.w3.to_checksum_address(safe_tx["to"]),
+                value=int(safe_tx["value"]),
+                data=HexBytes(data),
+                operation=int(safe_tx["operation"]),
+                safe_tx_gas=int(safe_tx["safeTxGas"]),
+                base_gas=int(safe_tx["baseGas"]),
+                gas_price=int(safe_tx["gasPrice"]),
+                gas_token=safe_tx["gasToken"],
+                refund_receiver=safe_tx["refundReceiver"],
+                safe_nonce=int(safe_tx["nonce"])
+            )
+            
+            # 使用私钥签名交易
+            print("使用私钥签名交易...")
+            tx.sign(self.private_key)
+            
+            # 发送到交易服务
+            print("发送交易到Safe交易服务...")
+            result = self.transaction_service_api.post_transaction(tx)
+            
+            if result:
+                print("交易已成功提议到Safe服务")
+                # 返回我们之前计算的交易哈希
+                return tx.safe_tx_hash.hex()
+            else:
+                raise Exception("交易提议失败")
+                
+        except Exception as e:
+            print(f"提议交易失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
         
